@@ -9,8 +9,8 @@ analytics to make trading decisions based on price action, support/resistance le
 and volume patterns. The dashboard visualizes price movements, trading decisions, and
 LLM reasoning in real-time.
 
-Author: Alvino
-Version: 3.1.0
+Author: Your Name
+Version: 1.0.0
 License: MIT
 """
 
@@ -18,9 +18,8 @@ License: MIT
 import os
 import json
 import time
-import logging
+import threading
 from datetime import datetime
-from typing import Dict, List, Tuple, Any, Optional, Union
 
 # Third-party imports
 import numpy as np
@@ -33,87 +32,50 @@ import dash_bootstrap_components as dbc
 
 # API client setup
 from dotenv import load_dotenv
+load_dotenv()  # load environment variables from .env file
 from openai import OpenAI
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('trading_dashboard.log')
-    ]
+# Configuration constants
+LLM_EVERY = 1  # Run LLM analysis on every n-th candle
+# OpenAI API client initialization
+client = OpenAI(
+    timeout=5.0,    # 5 second timeout
+    max_retries=2   # Limit retries to avoid hanging
 )
-logger = logging.getLogger(__name__)
-
-# Load environment variables from .env file
-load_dotenv()
 
 # -----------------------------------------------------------------------------
-# CONFIGURATION
+# CONFIGURAÇÕES BÁSICAS
 # -----------------------------------------------------------------------------
-
-class Config:
-    """Configuration settings for the application."""
-    
-    # LLM settings
-    LLM_EVERY = 1  # Run LLM analysis on every n-th candle
-    
-    # Trading settings
-    SUPPORT_RESISTANCE_LEVELS = [4.0, 3.9, 3.85, 3.8]
-    CONTRACT_MULTIPLIER = 10_000  # Each point (1.00 USD/MMBtu) = US$10,000 per contract
-    INITIAL_CONTRACTS = 5
-    
-    # Data settings
-    CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
-                          "agents_project01", "operacao_agent.csv")
-    
-    # OpenAI API configuration
-    OPENAI_MODEL = "gpt-3.5-turbo"
-    OPENAI_TIMEOUT = 5.0  # 5 second timeout
-    OPENAI_MAX_RETRIES = 2  # Limit retries to avoid hanging
-    
-    # UI settings
-    THEME = dbc.themes.DARKLY
-
+SUPPORT_RESISTANCE_LEVELS = [4.0, 3.9, 3.85, 3.8]
+CONTRACT_MULTIPLIER      = 10_000     # Cada ponto inteiro (1,00 USD/MMBtu) = US$10 000 por contrato
+#CSV_PATH                 = r"C:\Users\Alvino\Documents\DataH\agents_project01\operacao_agent.csv"
+CSV_PATH = r"C:\Users\Alvino\Documents\DataH\agent_projetc_simulation\operacao_test_llm.csv"
 
 # -----------------------------------------------------------------------------
-# DATA LOADING AND SIMULATION
+# CRIA SIMULAÇÃO CASO NÃO EXISTA CSV
 # -----------------------------------------------------------------------------
-
-def create_simulated_data() -> pd.DataFrame:
-    """
-    Create simulated natural gas price data if no CSV exists.
-    
-    Returns:
-        pd.DataFrame: Dataframe containing simulated price data.
-    """
-    logger.info("Creating simulated data...")
+if not os.path.exists(CSV_PATH):
     dates = pd.date_range(start='2025-01-01', periods=100, freq='H')
     np.random.seed(42)
     base_price = 3.9
     volatility = 0.15
     opens = [base_price]
-    
-    # Generate price data
     for i in range(1, 100):
         drift = np.random.normal(0, volatility * 0.1)
-        bias = -0.005
+        bias  = -0.005
         opens.append(max(3.7, min(4.1, opens[-1] + drift + bias)))
 
-    highs = [o + np.random.uniform(0.01, volatility * 0.5) for o in opens]
-    lows = [o - np.random.uniform(0.01, volatility * 0.5) for o in opens]
+    highs  = [o + np.random.uniform(0.01, volatility * 0.5) for o in opens]
+    lows   = [o - np.random.uniform(0.01, volatility * 0.5) for o in opens]
     closes = []
-    
     for i in range(100):
         if np.random.random() < 0.6:
             closes.append(opens[i] - np.random.uniform(0, (opens[i] - lows[i]) * 0.8))
         else:
             closes.append(opens[i] + np.random.uniform(0, (highs[i] - opens[i]) * 0.8))
 
-    volumes = np.random.randint(1000, 10000, 100)
+    volumes   = np.random.randint(1000, 10000, 100)
     daily_avg = pd.Series(closes).rolling(window=5).mean().fillna(method='bfill').tolist()
-    
     df = pd.DataFrame({
         'Date': dates,
         'Open': opens,
@@ -124,94 +86,52 @@ def create_simulated_data() -> pd.DataFrame:
         'Daily Avg(5)': daily_avg
     })
 
-    # Add support/resistance level touches
-    for level in Config.SUPPORT_RESISTANCE_LEVELS:
+    for level in SUPPORT_RESISTANCE_LEVELS:
         for i in range(5, 95, 20):
-            df.loc[i:i+5, 'Low'] = level - np.random.uniform(0, 0.03, 6)
+            df.loc[i:i+5, 'Low']   = level - np.random.uniform(0, 0.03, 6)
             df.loc[i:i+5, 'Close'] = level + np.random.uniform(-0.02, 0.02, 6)
 
-    # Save to temporary file if needed
     import tempfile
     temp_dir = tempfile.gettempdir()
-    csv_path = os.path.join(temp_dir, "natural_gas_data_sample.csv")
-    df.to_csv(csv_path, index=False)
-    logger.info(f"Simulated data file created at: {csv_path}")
-    
-    return df
-
-
-def load_data() -> pd.DataFrame:
-    """
-    Load price data from CSV or create simulated data if file doesn't exist.
-    
-    Returns:
-        pd.DataFrame: Dataframe containing price data.
-    """
-    if not os.path.exists(Config.CSV_PATH):
-        return create_simulated_data()
-    
-    logger.info(f"Loading data from {Config.CSV_PATH}")
-    df = pd.read_csv(Config.CSV_PATH)
-    
-    # Try different date formats to handle variability in input files
-    date_formats = [
-        '%m/%d/%y %H:%M', 
-        '%m/%d/%Y %H:%M', 
-        '%Y-%m-%d %H:%M:%S'
-    ]
-    
-    for fmt in date_formats:
-        try:
-            df['Date'] = pd.to_datetime(df['Date'], format=fmt)
-            logger.info(f"Successfully parsed dates with format: {fmt}")
-            break
-        except Exception:
-            continue
-    else:
-        # If none of the specific formats work, try the default parser
-        try:
-            df['Date'] = pd.to_datetime(df['Date'])
-            logger.info("Parsed dates with default format")
-        except Exception as e:
-            logger.error(f"Failed to parse dates: {e}")
-            raise ValueError("Could not parse dates in the CSV file.")
-    
-    return df
-
-
-# -----------------------------------------------------------------------------
-# LLM ANALYSIS FUNCTIONS
-# -----------------------------------------------------------------------------
-
-def ask_llm(
-    current_data: Dict[str, Any], 
-    price_history: List[Dict[str, Any]],
-    support_resistance_levels: List[float], 
-    current_contracts: int, 
-    entry_price: float, 
-    last_action: str
-) -> Tuple[Dict[str, Any], str]:
-    """
-    Ask the LLM for trading advice based on market data.
-    
-    Args:
-        current_data: Current candle data
-        price_history: Recent price history
-        support_resistance_levels: List of support/resistance price levels
-        current_contracts: Number of contracts currently held
-        entry_price: Average entry price of current position
-        last_action: Description of the last action taken
-        
-    Returns:
-        Tuple containing parsed decision dict and raw LLM response
-    """
+    CSV_PATH = os.path.join(temp_dir, "natural_gas_data_sample.csv")
+    df.to_csv(CSV_PATH, index=False)
+    print(f"Simulated data file created at: {CSV_PATH}")
+else:
+    df = pd.read_csv(CSV_PATH)
     try:
-        # Initialize OpenAI client
-        client = OpenAI(
-            timeout=Config.OPENAI_TIMEOUT,
-            max_retries=Config.OPENAI_MAX_RETRIES
-        )
-        
+        df['Date'] = pd.to_datetime(df['Date'], format='%m/%d/%y %H:%M')
+    except:
+        try:
+            df['Date'] = pd.to_datetime(df['Date'], format='%m/%d/%Y %H:%M')
+        except:
+            try:
+                df['Date'] = pd.to_datetime(df['Date'], format='%Y-%m-%d %H:%M:%S')
+            except:
+                df['Date'] = pd.to_datetime(df['Date'])
+
+# -----------------------------------------------------------------------------
+# ESTADO INICIAL DA POSIÇÃO
+# -----------------------------------------------------------------------------
+initial_contracts = 5
+current_contracts = initial_contracts
+last_action       = "Initial entry: 5 contracts (SHORT)"
+entry_price       = df['Close'].iloc[0]
+
+action_history = [{
+    "time":      df['Date'].iloc[0],
+    "action":    last_action,
+    "contracts": current_contracts,
+    "price":     df['Close'].iloc[0]
+}]
+analysis_history = []
+llm_thoughts     = "Starting market analysis for natural gas…"
+llm_confidence_explanation = "Awaiting first analysis..."
+
+# -----------------------------------------------------------------------------
+# FUNÇÕES UTILITÁRIAS
+# -----------------------------------------------------------------------------
+def ask_llm(current_data, price_history, support_resistance_levels, current_contracts, entry_price, last_action):
+    try:
         # Get the latest candle data
         open_price = current_data["Open"]
         high_price = current_data["High"]
@@ -221,23 +141,12 @@ def ask_llm(
         timestamp = current_data["Date"]
         
         # Get recent price history for context
-        recent_prices = [
-            {
-                "time": p["time"], 
-                "open": p["open"], 
-                "high": p["high"], 
-                "low": p["low"], 
-                "close": p["close"], 
-                "volume": p["volume"]
-            } 
-            for p in price_history
-        ]
+        recent_prices = [{"time": p["time"], "open": p["open"], "high": p["high"], 
+                         "low": p["low"], "close": p["close"], "volume": p["volume"]} 
+                        for p in price_history]
         
         # Find nearest support/resistance levels
-        nearest_levels = sorted(
-            [(lvl, abs(close_price - lvl)) for lvl in support_resistance_levels], 
-            key=lambda x: x[1]
-        )[:3]
+        nearest_levels = sorted([(lvl, abs(close_price - lvl)) for lvl in support_resistance_levels], key=lambda x: x[1])[:3]
         nearest_levels = [{"level": lvl, "distance": dist} for lvl, dist in nearest_levels]
         
         # Calculate some technical indicators for better decision making
@@ -332,19 +241,19 @@ Respond with a JSON object containing:
 2. "quantity": number of contracts to adjust (1-3 based on confidence)
 3. "reasoning": brief explanation of your decision (under 50 words)
 4. "confidence": your confidence level (0.0-1.0)
+5. "confidence_explanation": detailed explanation of why you chose this confidence level (under 100 words)
 
 Your response MUST be valid JSON without any text before or after. Format:
-{{"action": "ACTION", "quantity": N, "reasoning": "Your reasoning", "confidence": 0.X}}
+{{"action": "ACTION", "quantity": N, "reasoning": "Your reasoning", "confidence": 0.X, "confidence_explanation": "Your detailed explanation"}}
 """
-        logger.debug("Sending prompt to LLM")
         resp = client.chat.completions.create(
-            model=Config.OPENAI_MODEL,
+            model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": "You are a natural gas trading algorithm that responds only with valid JSON."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.3,
-            max_tokens=400
+            max_tokens=500
         )
         
         # Get the response and parse it as JSON
@@ -352,427 +261,345 @@ Your response MUST be valid JSON without any text before or after. Format:
         try:
             # Try to parse the response as JSON
             decision = json.loads(content)
-            logger.info(f"LLM decision: {decision['action']} with confidence {decision['confidence']}")
             # Also save the raw response for debugging
             return decision, content
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse LLM response: {e}")
-            logger.debug(f"Raw response: {content}")
+        except json.JSONDecodeError:
             # If parsing fails, return a default "hold" decision
-            return {
-                "action": "HOLD", 
-                "quantity": 0, 
-                "reasoning": "Failed to parse LLM response", 
-                "confidence": 0.0
-            }, content
+            return {"action": "HOLD", "quantity": 0, "reasoning": "Failed to parse LLM response", "confidence": 0.0, "confidence_explanation": "Error parsing LLM response"}, content
     except Exception as e:
-        logger.error(f"LLM API error: {str(e)}")
         # If any exception occurs, return a default "hold" decision
-        return {
-            "action": "HOLD", 
-            "quantity": 0, 
-            "reasoning": f"LLM error: {str(e)}", 
-            "confidence": 0.0
-        }, "LLM unavailable."
+        return {"action": "HOLD", "quantity": 0, "reasoning": f"LLM error: {str(e)}", "confidence": 0.0, "confidence_explanation": f"Error communicating with LLM: {str(e)}"}, "LLM unavailable."
 
+def get_confidence_color(confidence):
+    """Return a color based on confidence level"""
+    if confidence >= 0.8:
+        return "success"  # Green
+    elif confidence >= 0.6:
+        return "primary"  # Blue
+    elif confidence >= 0.4:
+        return "warning"  # Yellow
+    else:
+        return "danger"   # Red
 
 # -----------------------------------------------------------------------------
-# DASH APP LAYOUT
+# DASH APP
 # -----------------------------------------------------------------------------
+app    = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
+server = app.server
 
-def create_app(df: pd.DataFrame) -> dash.Dash:
-    """
-    Create and configure the Dash application.
-    
-    Args:
-        df: DataFrame containing price data
-        
-    Returns:
-        dash.Dash: Configured Dash application
-    """
-    app = dash.Dash(__name__, external_stylesheets=[Config.THEME])
-    server = app.server
-    
-    # Initial trading state
-    initial_contracts = Config.INITIAL_CONTRACTS
-    current_contracts = initial_contracts
-    last_action = f"Initial entry: {initial_contracts} contracts (SHORT)"
-    entry_price = df['Close'].iloc[0]
-
-    action_history = [{
-        "time": df['Date'].iloc[0],
-        "action": last_action,
-        "contracts": current_contracts,
-        "price": df['Close'].iloc[0]
-    }]
-    analysis_history = []
-    llm_thoughts = "Starting market analysis for natural gas…"
-    
-    # App layout
-    app.layout = html.Div([
-        # Header
-        dbc.Row([
-            dbc.Col(html.H1("Natural Gas Trading Dashboard with LLM", className="text-center mb-4"), width=12)
-        ]),
-        
-        # Controls
-        dbc.Row([
-            dbc.Col(dbc.Card([
-                dbc.CardHeader("Simulation Controls"),
+app.layout = html.Div([
+    dbc.Row([
+        dbc.Col(html.H1("Natural Gas Trading Dashboard with LLM", className="text-center mb-4"), width=12)
+    ]),
+    dbc.Row([
+        dbc.Col(dbc.Card([
+            dbc.CardHeader("Simulation Controls"),
+            dbc.CardBody([
+                dbc.Button("Start Simulation", id="start-button", color="success", className="me-2"),
+                dbc.Button("Pause", id="pause-button", color="warning", className="me-2"),
+                dbc.Button("Restart", id="reset-button", color="danger"),
+                html.Hr(),
+                html.Label("Speed (seconds per candle):"),
+                dcc.Slider(id="speed-slider", min=0.2, max=3, step=0.2, value=1,
+                           marks={i: f"{i}s" for i in [0.2,1,2,3]})
+            ])
+        ]), width=12, className="mb-4")
+    ]),
+    dbc.Row([
+        dbc.Col(dbc.Card([
+            dbc.CardHeader("Price Chart"),
+            dbc.CardBody(dcc.Graph(id="price-chart", style={"height":"600px"}, config={"displayModeBar":False}))
+        ]), width=8),
+        dbc.Col([
+            dbc.Card([
+                dbc.CardHeader("Status"),
                 dbc.CardBody([
-                    dbc.Button("Start Simulation", id="start-button", color="success", className="me-2"),
-                    dbc.Button("Pause", id="pause-button", color="warning", className="me-2"),
-                    dbc.Button("Restart", id="reset-button", color="danger"),
+                    html.H5("Current Position:"), html.H3(id="current-position"),
                     html.Hr(),
-                    html.Label("Speed (seconds per candle):"),
-                    dcc.Slider(id="speed-slider", min=0.2, max=3, step=0.2, value=1,
-                               marks={i: f"{i}s" for i in [0.2,1,2,3]})
+                    html.H5("Current Price:"), html.H3(id="current-price"),
+                    html.Hr(),
+                    html.H5("P&L:"), html.H3(id="pnl")
                 ])
-            ]), width=12, className="mb-4")
-        ]),
-        
-        # Main content
-        dbc.Row([
-            # Price chart
-            dbc.Col(dbc.Card([
-                dbc.CardHeader("Price Chart"),
-                dbc.CardBody(dcc.Graph(id="price-chart", style={"height":"600px"}, config={"displayModeBar":False}))
-            ]), width=8),
-            
-            # Status and analysis
-            dbc.Col([
-                dbc.Card([
-                    dbc.CardHeader("Status"),
-                    dbc.CardBody([
-                        html.H5("Current Position:"), html.H3(id="current-position"),
-                        html.Hr(),
-                        html.H5("Current Price:"), html.H3(id="current-price"),
-                        html.Hr(),
-                        html.H5("P&L:"), html.H3(id="pnl")
-                    ])
-                ], className="mb-4"),
-                dbc.Card([
-                    dbc.CardHeader("LLM Analysis"),
-                    dbc.CardBody([
-                        html.H5("Thoughts:"), html.Pre(id="llm-thoughts", style={
-                            "whiteSpace":"pre-wrap","fontSize":"0.85rem",
-                            "backgroundColor":"#343a40","padding":"10px","borderRadius":"5px"}),
-                        html.Hr(),
-                        html.H5("Last action:"), html.Div(id="llm-action", style={"fontWeight":"bold"})
+            ], className="mb-4"),
+            dbc.Card([
+                dbc.CardHeader("LLM Analysis"),
+                dbc.CardBody([
+                    dbc.Tabs([
+                        dbc.Tab([
+                            html.H5("Thoughts:"), 
+                            html.Pre(id="llm-thoughts", style={
+                                "whiteSpace":"pre-wrap","fontSize":"0.85rem",
+                                "backgroundColor":"#343a40","padding":"10px","borderRadius":"5px"}),
+                            html.Hr(),
+                            html.H5("Last action:"), 
+                            html.Div(id="llm-action", style={"fontWeight":"bold"})
+                        ], label="Analysis"),
+                        dbc.Tab([
+                            html.H5("Confidence Level:"),
+                            html.Div([
+                                dbc.Progress(id="confidence-bar", value=0, color="success", 
+                                             className="mb-3", style={"height": "20px"}),
+                                html.Div(id="confidence-value", className="text-center")
+                            ]),
+                            html.Hr(),
+                            html.H5("Explanation:"),
+                            html.Div(id="confidence-explanation", style={
+                                "backgroundColor":"#343a40","padding":"10px","borderRadius":"5px",
+                                "fontSize":"0.9rem"})
+                        ], label="Confiance")
                     ])
                 ])
-            ], width=4)
-        ]),
-        
-        # History
-        dbc.Row(dbc.Col(dbc.Card([
-            dbc.CardHeader("Action & Analysis History"),
-            dbc.CardBody(html.Div(id="action-history", style={"maxHeight":"500px","overflowY":"auto"}))
-        ]), width=12), className="mt-4"),
-        
-        # Store component for state
-        dcc.Store(id="simulation-data", data={
+            ])
+        ], width=4)
+    ]),
+    dbc.Row(dbc.Col(dbc.Card([
+        dbc.CardHeader("Action & Analysis History"),
+        dbc.CardBody(html.Div(id="action-history", style={"maxHeight":"500px","overflowY":"auto"}))
+    ]), width=12), className="mt-4"),
+    dcc.Store(id="simulation-data", data={
+        "is_running": False,
+        "current_index": 0,
+        "speed": 1.0,
+        "data": df.to_dict('records'),
+        "current_contracts": current_contracts,
+        "entry_price": entry_price,
+        "action_history": action_history,
+        "analysis_history": analysis_history,
+        "llm_thoughts": llm_thoughts,
+        "last_action": last_action,
+        "confidence": 0.0,
+        "confidence_explanation": llm_confidence_explanation
+    }),
+    dcc.Interval(id="simulation-interval", interval=2000, n_intervals=0, disabled=True)
+])
+
+# -----------------------------------------------------------------------------
+# CALLBACK – CONTROLE DA SIMULAÇÃO
+# -----------------------------------------------------------------------------
+@app.callback(
+    [Output("simulation-interval","disabled"),
+     Output("simulation-interval","interval"),
+     Output("simulation-data","data", allow_duplicate=True)],
+    [Input("start-button","n_clicks"), Input("pause-button","n_clicks"),
+     Input("reset-button","n_clicks"), Input("speed-slider","value")],
+    [State("simulation-data","data")],
+    prevent_initial_call=True
+)
+def control_simulation(start, pause, reset, speed, data):
+    ctx = callback_context
+    if not ctx.triggered: return dash.no_update, dash.no_update, dash.no_update
+    trg = ctx.triggered[0]["prop_id"].split(".")[0]
+    if trg=="start-button":
+        data["is_running"]=True; return False, int(speed*1000), data
+    if trg=="pause-button":
+        data["is_running"]=False; return True, dash.no_update, data
+    if trg=="reset-button":
+        data.update({
             "is_running": False,
             "current_index": 0,
-            "speed": 1.0,
-            "data": df.to_dict('records'),
-            "current_contracts": current_contracts,
-            "entry_price": entry_price,
-            "action_history": action_history,
-            "analysis_history": analysis_history,
-            "llm_thoughts": llm_thoughts,
-            "last_action": last_action
-        }),
-        
-        # Interval for simulation updates
-        dcc.Interval(id="simulation-interval", interval=2000, n_intervals=0, disabled=True)
-    ])
-    
-    return app
-
+            "current_contracts": initial_contracts,
+            "entry_price": df['Close'].iloc[0],
+            "action_history": [{
+                "time": df['Date'].iloc[0],
+                "action": "Initial entry: 5 contracts (SHORT)",
+                "contracts": initial_contracts,
+                "price": df['Close'].iloc[0]
+            }],
+            "analysis_history": [],
+            "llm_thoughts": "Restarting natural gas market analysis…",
+            "last_action": "Initial entry: 5 contracts (SHORT)",
+            "confidence": 0.0,
+            "confidence_explanation": "Awaiting first analysis..."
+        })
+        return True, dash.no_update, data
+    return dash.no_update, int(speed*1000), dash.no_update
 
 # -----------------------------------------------------------------------------
-# DASH CALLBACKS
+# CALLBACK – AVANÇA A SIMULAÇÃO
 # -----------------------------------------------------------------------------
+@app.callback(
+    [Output("price-chart","figure"), Output("current-position","children"),
+     Output("current-price","children"), Output("pnl","children"),
+     Output("llm-thoughts","children"), Output("llm-action","children"),
+     Output("confidence-bar", "value"), Output("confidence-bar", "color"),
+     Output("confidence-value", "children"), Output("confidence-explanation", "children"),
+     Output("action-history","children"), Output("simulation-data","data")],
+    [Input("simulation-interval","n_intervals")], [State("simulation-data","data")]
+)
+def update_simulation(n, data):
+    if not data["is_running"]:
+        return [dash.no_update]*12
+    idx = data["current_index"]
+    if idx >= len(data["data"]) - 1:
+        data["is_running"]=False; return [dash.no_update]*11 + [data]
+    idx += 1; data["current_index"]=idx
 
-def register_callbacks(app: dash.Dash) -> None:
-    """
-    Register all callbacks for the Dash application.
-    
-    Args:
-        app: Dash application instance
-    """
-    
-    @app.callback(
-        [Output("simulation-interval", "disabled"),
-         Output("simulation-interval", "interval"),
-         Output("simulation-data", "data", allow_duplicate=True)],
-        [Input("start-button", "n_clicks"), Input("pause-button", "n_clicks"),
-         Input("reset-button", "n_clicks"), Input("speed-slider", "value")],
-        [State("simulation-data", "data")],
-        prevent_initial_call=True
-    )
-    def control_simulation(start, pause, reset, speed, data):
-        """Control the simulation (start, pause, reset) and adjust speed."""
-        ctx = callback_context
-        if not ctx.triggered: 
-            return dash.no_update, dash.no_update, dash.no_update
-            
-        trg = ctx.triggered[0]["prop_id"].split(".")[0]
+    recs         = data["data"][:idx+1]
+    current_price= recs[-1]["Close"]
+    open_price   = recs[-1]["Open"]
+
+    # LLM for complete market analysis and trading decisions
+    if idx % LLM_EVERY == 0:
+        # Prepare recent price history with full OHLCV data
+        ph = [{
+            "time": recs[i]["Date"],
+            "open": recs[i]["Open"], 
+            "high": recs[i]["High"],
+            "low": recs[i]["Low"],
+            "close": recs[i]["Close"],
+            "volume": recs[i]["Volume"]
+        } for i in range(max(0, idx-10), idx+1)]
         
-        if trg == "start-button":
-            data["is_running"] = True
-            return False, int(speed*1000), data
+        # Get LLM decision as structured JSON
+        decision, raw_response = ask_llm(
+            recs[-1],
+            ph,
+            SUPPORT_RESISTANCE_LEVELS,
+            data["current_contracts"],
+            data["entry_price"],
+            data["last_action"]
+        )
+        
+        # Store the raw response for display
+        data["llm_thoughts"] = raw_response
+        data["analysis_history"].append({
+            "time": recs[-1]["Date"], 
+            "price": current_price, 
+            "thoughts": raw_response
+        })
+        
+        # Process the LLM's structured decision
+        action = decision.get("action", "HOLD")
+        quantity = decision.get("quantity", 0)
+        reasoning = decision.get("reasoning", "No reasoning provided")
+        confidence = decision.get("confidence", 0.0)
+        confidence_explanation = decision.get("confidence_explanation", "No explanation provided")
+        
+        # Store confidence data
+        data["confidence"] = confidence
+        data["confidence_explanation"] = confidence_explanation
+        
+        # Debug info - always log decision even if HOLD
+        print(f"LLM Decision: {action}, Qty: {quantity}, Conf: {confidence:.2f}, Reason: {reasoning}")
+        
+        # Execute the trading action if not HOLD and quantity > 0
+        # Also log holds with high confidence so we can see what's happening
+        if (action != "HOLD" and quantity > 0) or confidence > 0.6:
+            old = data["current_contracts"]
             
-        if trg == "pause-button":
-            data["is_running"] = False
-            return True, dash.no_update, data
-            
-        if trg == "reset-button":
-            # Get the initial data from the Config settings
-            data.update({
-                "is_running": False,
-                "current_index": 0,
-                "current_contracts": Config.INITIAL_CONTRACTS,
-                "entry_price": df['Close'].iloc[0],
-                "action_history": [{
-                    "time": df['Date'].iloc[0],
-                    "action": f"Initial entry: {Config.INITIAL_CONTRACTS} contracts (SHORT)",
-                    "contracts": Config.INITIAL_CONTRACTS,
-                    "price": df['Close'].iloc[0]
-                }],
-                "analysis_history": [],
-                "llm_thoughts": "Restarting natural gas market analysis…",
-                "last_action": f"Initial entry: {Config.INITIAL_CONTRACTS} contracts (SHORT)"
-            })
-            return True, dash.no_update, data
-            
-        return dash.no_update, int(speed*1000), dash.no_update
-
-    @app.callback(
-        [Output("price-chart", "figure"), Output("current-position", "children"),
-         Output("current-price", "children"), Output("pnl", "children"),
-         Output("llm-thoughts", "children"), Output("llm-action", "children"),
-         Output("action-history", "children"), Output("simulation-data", "data")],
-        [Input("simulation-interval", "n_intervals")], 
-        [State("simulation-data", "data")]
-    )
-    def update_simulation(n, data):
-        """Update the simulation state and UI elements for each time step."""
-        if not data["is_running"]:
-            return [dash.no_update] * 8
-            
-        idx = data["current_index"]
-        if idx >= len(data["data"]) - 1:
-            data["is_running"] = False
-            return [dash.no_update] * 7 + [data]
-            
-        idx += 1
-        data["current_index"] = idx
-
-        recs = data["data"][:idx+1]
-        current_price = recs[-1]["Close"]
-        open_price = recs[-1]["Open"]
-
-        # LLM for complete market analysis and trading decisions
-        if idx % Config.LLM_EVERY == 0:
-            # Prepare recent price history with full OHLCV data
-            ph = [{
-                "time": recs[i]["Date"],
-                "open": recs[i]["Open"], 
-                "high": recs[i]["High"],
-                "low": recs[i]["Low"],
-                "close": recs[i]["Close"],
-                "volume": recs[i]["Volume"]
-            } for i in range(max(0, idx-10), idx+1)]
-            
-            # Get LLM decision as structured JSON
-            decision, raw_response = ask_llm(
-                recs[-1],
-                ph,
-                Config.SUPPORT_RESISTANCE_LEVELS,
-                data["current_contracts"],
-                data["entry_price"],
-                data["last_action"]
-            )
-            
-            # Store the raw response for display
-            data["llm_thoughts"] = raw_response
-            data["analysis_history"].append({
-                "time": recs[-1]["Date"], 
-                "price": current_price, 
-                "thoughts": raw_response
-            })
-            
-            # Process the LLM's structured decision
-            action = decision.get("action", "HOLD")
-            quantity = decision.get("quantity", 0)
-            reasoning = decision.get("reasoning", "No reasoning provided")
-            confidence = decision.get("confidence", 0.0)
-            
-            # Debug info - always log decision even if HOLD
-            logger.debug(f"LLM Decision: {action}, Qty: {quantity}, Conf: {confidence:.2f}, Reason: {reasoning}")
-            
-            # Execute the trading action if not HOLD and quantity > 0
-            # Also log holds with high confidence so we can see what's happening
-            if (action != "HOLD" and quantity > 0) or confidence > 0.6:
-                old = data["current_contracts"]
+            if action == "ADD_SHORT":
+                # For high confidence signals, consider using the suggested quantity
+                # For lower confidence, still take at least 1 contract if above threshold
+                adjusted_qty = quantity if confidence >= 0.7 else max(1, quantity-1)
+                data["current_contracts"] += adjusted_qty
+                new = data["current_contracts"]
+                # weighted average of entry_price
+                data["entry_price"] = (data["entry_price"]*old + current_price*adjusted_qty)/new
                 
-                if action == "ADD_SHORT":
-                    # For high confidence signals, consider using the suggested quantity
-                    # For lower confidence, still take at least 1 contract if above threshold
-                    adjusted_qty = quantity if confidence >= 0.7 else max(1, quantity-1)
-                    data["current_contracts"] += adjusted_qty
-                    new = data["current_contracts"]
-                    # weighted average of entry_price
-                    data["entry_price"] = (data["entry_price"]*old + current_price*adjusted_qty)/new
-                    
-                    act = (f"LLM DECISION: {action} {adjusted_qty} → {new} contracts @ {current_price:.4f}; "
-                          f"AvgEntry={data['entry_price']:.4f}; "
-                          f"Reasoning: {reasoning} (Conf: {confidence:.2f})")
-                          
-                elif action == "REDUCE_SHORT" and old >= quantity:
-                    # Adjust quantity if needed based on confidence
-                    adjusted_qty = min(quantity, old)  # Can't reduce below 0
-                    data["current_contracts"] -= adjusted_qty
-                    new = data["current_contracts"]
-                    # Entry price stays the same when reducing position
-                    
-                    act = (f"LLM DECISION: {action} {adjusted_qty} → {new} contracts @ {current_price:.4f}; "
-                          f"AvgEntry={data['entry_price']:.4f}; "
-                          f"Reasoning: {reasoning} (Conf: {confidence:.2f})")
-                    
-                elif action == "HOLD" and confidence > 0.6:
-                    # Just log the hold decision with high confidence for transparency
-                    act = (f"LLM DECISION: {action} @ {current_price:.4f}; "
-                          f"Reasoning: {reasoning} (Conf: {confidence:.2f})")
-                    
-                else:
-                    # Unsupported action or invalid quantity
-                    act = None
-                    
-                if act:  # Only update if a valid action was taken
-                    data["action_history"].append({
-                        "time": recs[-1]["Date"],
-                        "action": act,
-                        "contracts": data["current_contracts"],
-                        "price": current_price
-                    })
-                    data["last_action"] = act
+                act = (f"LLM DECISION: {action} {adjusted_qty} → {new} contracts @ {current_price:.4f}; "
+                       f"AvgEntry={data['entry_price']:.4f}; "
+                       f"Reasoning: {reasoning} (Conf: {confidence:.2f})")
+                       
+            elif action == "REDUCE_SHORT" and old >= quantity:
+                # Adjust quantity if needed based on confidence
+                adjusted_qty = min(quantity, old)  # Can't reduce below 0
+                data["current_contracts"] -= adjusted_qty
+                new = data["current_contracts"]
+                # Entry price stays the same when reducing position
+                
+                act = (f"LLM DECISION: {action} {adjusted_qty} → {new} contracts @ {current_price:.4f}; "
+                       f"AvgEntry={data['entry_price']:.4f}; "
+                       f"Reasoning: {reasoning} (Conf: {confidence:.2f})")
+                
+            elif action == "HOLD" and confidence > 0.6:
+                # Just log the hold decision with high confidence for transparency
+                act = (f"LLM DECISION: {action} @ {current_price:.4f}; "
+                       f"Reasoning: {reasoning} (Conf: {confidence:.2f})")
+                
+            else:
+                # Unsupported action or invalid quantity
+                act = None
+                
+            if act:  # Only update if a valid action was taken
+                data["action_history"].append({
+                    "time": recs[-1]["Date"],
+                    "action": act,
+                    "contracts": data["current_contracts"],
+                    "price": current_price
+                })
+                data["last_action"] = act
 
-        # Calculate P&L
-        delta = data["entry_price"] - current_price
-        pnl = delta * Config.CONTRACT_MULTIPLIER * data["current_contracts"]
+    # 3️⃣ P&L total
+    delta = data["entry_price"] - current_price
+    pnl = delta * CONTRACT_MULTIPLIER * data["current_contracts"]
 
-        # Create price chart
-        fig = make_subplots(
-            rows=2, cols=1, 
-            shared_xaxes=True,
-            vertical_spacing=0.1, 
-            row_heights=[0.8, 0.2],
-            specs=[[{"type": "candlestick"}], [{"type": "bar"}]]
-        )
-        
-        # Add candlestick chart
-        fig.add_trace(go.Candlestick(
-            x=[r["Date"] for r in recs], 
-            open=[r["Open"] for r in recs],
-            high=[r["High"] for r in recs], 
-            low=[r["Low"] for r in recs],
-            close=[r["Close"] for r in recs], 
-            name="Price"
-        ), row=1, col=1)
-        
-        # Add support/resistance levels
-        for lvl in Config.SUPPORT_RESISTANCE_LEVELS:
-            fig.add_shape(
-                type="line", 
-                x0=recs[0]["Date"], 
-                x1=recs[-1]["Date"],
-                y0=lvl, 
-                y1=lvl, 
-                line=dict(dash="dash"), 
-                row=1, 
-                col=1
-            )
-            
-        # Add volume bars
-        fig.add_trace(go.Bar(
-            x=[r["Date"] for r in recs], 
-            y=[r["Volume"] for r in recs],
-            name="Volume"
-        ), row=2, col=1)
-        
-        # Add action markers
-        actions = [a for a in data["action_history"] if a["time"] in [r["Date"] for r in recs]]
-        fig.add_trace(go.Scatter(
-            x=[a["time"] for a in actions], 
-            y=[a["price"] for a in actions],
-            mode="markers", 
-            marker=dict(symbol="star", size=10), 
-            name="Actions"
-        ), row=1, col=1)
-        
-        # Update layout
-        fig.update_layout(
-            template="plotly_dark", 
-            legend=dict(orientation="h", y=1.02)
-        )
-        fig.update_xaxes(type="category")
+    # 4️⃣ Gráfico
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.1, row_heights=[0.8,0.2],
+                        specs=[[{"type":"candlestick"}],[{"type":"bar"}]])
+    fig.add_trace(go.Candlestick(
+        x=[r["Date"] for r in recs], open=[r["Open"] for r in recs],
+        high=[r["High"] for r in recs], low=[r["Low"] for r in recs],
+        close=[r["Close"] for r in recs], name="Price"
+    ), row=1, col=1)
+    # fig.add_trace(go.Scatter(
+    #     x=[r["Date"] for r in recs], y=[r["Daily Avg(5)"] for r in recs],
+    #     name="5-day MA", line=dict(width=1)
+    # ), row=1, col=1)
+    for lvl in SUPPORT_RESISTANCE_LEVELS:
+        fig.add_shape(type="line", x0=recs[0]["Date"], x1=recs[-1]["Date"],
+                      y0=lvl, y1=lvl, line=dict(dash="dash"), row=1, col=1)
+    fig.add_trace(go.Bar(
+        x=[r["Date"] for r in recs], y=[r["Volume"] for r in recs],
+        name="Volume"
+    ), row=2, col=1)
+    actions = [a for a in data["action_history"] if a["time"] in [r["Date"] for r in recs]]
+    fig.add_trace(go.Scatter(
+        x=[a["time"] for a in actions], y=[a["price"] for a in actions],
+        mode="markers", marker=dict(symbol="star", size=10), name="Actions"
+    ), row=1, col=1)
+    fig.update_layout(template="plotly_dark", legend=dict(orientation="h", y=1.02))
+    fig.update_xaxes(type="category")
 
-        # Generate history component
-        combo = []
-        for a in data["action_history"]:
-            combo.append({"time": a["time"], "content": a["action"], "type": "ACTION"})
-        for an in data["analysis_history"]:
-            combo.append({"time": an["time"], "content": an["thoughts"], "type": "ANALYSIS"})
-        combo.sort(key=lambda x: x["time"], reverse=True)
-        
-        hist = []
-        for itm in combo[:20]:
-            color = "yellow" if itm["type"] == "ACTION" else "lightblue"
-            hist.append(html.Div([
-                html.Span(f"{itm['time']}: ", style={"fontWeight": "bold"}),
-                html.Span(itm["content"], style={"color": color})
-            ], style={"marginBottom": "6px"}))
+    # 5️⃣ Histórico combinado
+    combo = []
+    for a in data["action_history"]:
+        combo.append({"time": a["time"], "content": a["action"], "type": "ACTION"})
+    for an in data["analysis_history"]:
+        combo.append({"time": an["time"], "content": an["thoughts"], "type": "ANALYSIS"})
+    combo.sort(key=lambda x: x["time"], reverse=True)
+    hist = []
+    for itm in combo[:20]:
+        color = "yellow" if itm["type"]=="ACTION" else "lightblue"
+        hist.append(html.Div([
+            html.Span(f"{itm['time']}: ", style={"fontWeight":"bold"}),
+            html.Span(itm["content"], style={"color": color})
+        ], style={"marginBottom":"6px"}))
+    
+    # 6️⃣ Confidence info
+    confidence_value = data["confidence"] * 100  # Convert to percentage
+    confidence_color = get_confidence_color(data["confidence"])
+    confidence_text = f"Confidence: {confidence_value:.1f}%"
 
-        return (
-            fig,
-            f"{data['current_contracts']} Contracts (SHORT)",
-            f"{current_price:.4f}",
-            f"{pnl:,.2f} USD" + (" (Profit)" if pnl > 0 else " (Loss)"),
-            data["llm_thoughts"],
-            data["last_action"],
-            hist,
-            data
-        )
-
+    return (
+        fig,
+        f"{data['current_contracts']} Contracts (SHORT)",
+        f"{current_price:.4f}",
+        f"{pnl:,.2f} USD" + (" (Profit)" if pnl>0 else " (Loss)"),
+        data["llm_thoughts"],
+        data["last_action"],
+        confidence_value,
+        confidence_color,
+        confidence_text,
+        data["confidence_explanation"],
+        hist,
+        data
+    )
 
 # -----------------------------------------------------------------------------
-# MAIN FUNCTION
+# RUN SERVER
 # -----------------------------------------------------------------------------
-
-def main():
-    """
-    Main entry point for the application.
-    """
-    try:
-        # Load or create data
-        df = load_data()
-        
-        # Create and configure app
-        app = create_app(df)
-        
-        # Register callbacks
-        register_callbacks(app)
-        
-        # Run server
-        logger.info("Starting server...")
-        app.run_server(debug=True, port=8050)
-    except Exception as e:
-        logger.critical(f"Application failed to start: {e}", exc_info=True)
-        raise
-
+# No need for this callback anymore as we're not tracking support_break
 
 if __name__ == "__main__":
-    main()
+    app.run(debug=True, port=8050)
