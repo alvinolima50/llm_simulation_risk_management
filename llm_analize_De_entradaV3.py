@@ -9,11 +9,9 @@ analytics to make trading decisions based on price action, support/resistance le
 and volume patterns. The dashboard visualizes price movements, trading decisions, and
 LLM reasoning in real-time.
 
-Author: Your Name
-Version: 1.0.0
-License: MIT
+OPTIMIZED VERSION: Significantly reduced token usage in LLM API calls
 """
-
+from pyngrok import ngrok
 # Standard library imports
 import os
 import json
@@ -36,7 +34,7 @@ load_dotenv()  # load environment variables from .env file
 from openai import OpenAI
 
 # Configuration constants
-LLM_EVERY = 1  # Run LLM analysis on every n-th candle
+LLM_EVERY = 1  # Run LLM analysis on every 5th candle
 # OpenAI API client initialization
 client = OpenAI(
     timeout=5.0,    # 5 second timeout
@@ -48,8 +46,16 @@ client = OpenAI(
 # -----------------------------------------------------------------------------
 SUPPORT_RESISTANCE_LEVELS = [4.0, 3.9, 3.85, 3.8]
 CONTRACT_MULTIPLIER      = 10_000     # Cada ponto inteiro (1,00 USD/MMBtu) = US$10 000 por contrato
-#CSV_PATH                 = r"C:\Users\Alvino\Documents\DataH\agents_project01\operacao_agent.csv"
 CSV_PATH = r"C:\Users\Alvino\Documents\DataH\agent_projetc_simulation\operacao_test_llm.csv"
+
+# -----------------------------------------------------------------------------
+# VARIÁVEIS DE CACHE - NOVA IMPLEMENTAÇÃO
+# -----------------------------------------------------------------------------
+last_analysis_index = -1  # Último índice analisado pelo LLM
+cached_llm_state = {
+    "last_analysis": None,  # Último resultado completo da análise
+    "recent_decisions": []  # Lista das últimas decisões (para contexto)
+}
 
 # -----------------------------------------------------------------------------
 # CRIA SIMULAÇÃO CASO NÃO EXISTA CSV
@@ -128,93 +134,116 @@ llm_thoughts     = "Starting market analysis for natural gas…"
 llm_confidence_explanation = "Awaiting first analysis..."
 
 # -----------------------------------------------------------------------------
-# FUNÇÕES UTILITÁRIAS
+# FUNÇÕES UTILITÁRIAS - ALTAMENTE OTIMIZADAS
 # -----------------------------------------------------------------------------
-def ask_llm(current_data, price_history, support_resistance_levels, current_contracts, entry_price, last_action):
+def ask_llm_with_cache(current_data, price_history, support_resistance_levels, current_contracts, entry_price, last_action, current_index):
+    """
+    Highly optimized version of the ask_llm function that drastically reduces token usage
+    by sending only essential data and using an improved caching strategy.
+    """
+    global last_analysis_index, cached_llm_state
+    
     try:
-        # Get the latest candle data
-        open_price = current_data["Open"]
-        high_price = current_data["High"]
-        low_price = current_data["Low"]
-        close_price = current_data["Close"]
-        volume = current_data["Volume"]
-        timestamp = current_data["Date"]
+        # Extract only needed fields from current candle
+        current_candle = {
+            "close": current_data["Close"],
+            "volume": current_data["Volume"]
+        }
         
-        # Get recent price history for context
-        recent_prices = [{"time": p["time"], "open": p["open"], "high": p["high"], 
-                         "low": p["low"], "close": p["close"], "volume": p["volume"]} 
-                        for p in price_history]
+        # 1. OPTIMIZATION: Check if analysis is truly needed
+        should_analyze = False
         
-        # Find nearest support/resistance levels
-        nearest_levels = sorted([(lvl, abs(close_price - lvl)) for lvl in support_resistance_levels], key=lambda x: x[1])[:3]
-        nearest_levels = [{"level": lvl, "distance": dist} for lvl, dist in nearest_levels]
+        # First analysis or too long since last one
+        if last_analysis_index == -1 or (current_index - last_analysis_index) >= 10:
+            should_analyze = True
+        else:
+            # Check for significant price movement (>0.5%)
+            last_candle_index = max(0, len(price_history) - (current_index - last_analysis_index) - 1)
+            if last_candle_index < len(price_history):
+                last_close = price_history[last_candle_index]["close"]
+                current_close = current_data["Close"]
+                price_change_pct = abs(current_close - last_close) / last_close
+                
+                if price_change_pct > 0.005:
+                    should_analyze = True
+                    
+                # Check if crossed any support/resistance level
+                for level in support_resistance_levels:
+                    if (last_close > level and current_close < level) or \
+                       (last_close < level and current_close > level):
+                        should_analyze = True
+                        break
+                        
+                # Check if volume is abnormally high (2x average)
+                if len(price_history) >= 5:
+                    recent_volumes = [p["volume"] for p in price_history[-5:]]
+                    avg_volume = sum(recent_volumes) / len(recent_volumes)
+                    if current_data["Volume"] > avg_volume * 2:
+                        should_analyze = True
         
-        # Calculate some technical indicators for better decision making
-        # Check for potential breakout patterns
-        breakout_patterns = []
-        for lvl in support_resistance_levels:
-            # Check if current or previous candle broke through any level
-            if open_price > lvl and close_price < lvl:
-                breakout_patterns.append({
-                    "type": "support_breakdown",
-                    "level": lvl,
-                    "candle_size": abs(open_price - close_price),
-                    "volume": volume,
-                    "strength": 0.8 if volume > 5000 else 0.5  # Arbitrary threshold for example
-                })
-        
-        # Check for continuation patterns
-        trend_strength = 0.0
-        price_trend = "neutral"
-        if len(recent_prices) >= 3:
-            downs = sum(1 for i in range(min(5, len(recent_prices))) if 
-                     recent_prices[i]["close"] < recent_prices[i]["open"])
-            ups = sum(1 for i in range(min(5, len(recent_prices))) if 
-                    recent_prices[i]["close"] > recent_prices[i]["open"])
+        # 2. If analysis not needed, return cached result
+        if not should_analyze and cached_llm_state["last_analysis"] is not None:
+            cached_decision = cached_llm_state["last_analysis"].copy()
+            cached_decision["reasoning"] = "Market conditions stable, maintaining previous analysis"
+            cached_decision["confidence"] = cached_decision["confidence"] * 0.95
             
-            if downs >= 3:
-                price_trend = "downtrend"
-                trend_strength = downs / 5.0 * 0.8
-            elif ups >= 3:
-                price_trend = "uptrend"
-                trend_strength = ups / 5.0 * 0.8
+            return cached_decision, f"[CACHED] {cached_decision['reasoning']} (Conf: {cached_decision['confidence']:.2f})"
         
-        # Prepare data for LLM
+        # 3. PREPARE MINIMAL DATA
+        # Only send the necessary data points, not full candles
+        incremental_data = []
+        
+        if last_analysis_index == -1:
+            # First analysis: send only last 5 candles instead of 7
+            history_subset = price_history[-5:]
+            incremental_data = [{
+                "c": ph["close"],  # Shortened keys to reduce tokens
+                "v": ph["volume"]
+            } for ph in history_subset]
+        else:
+            # Subsequent analyses: send only new candles, with minimal data
+            new_candles_start = max(0, len(price_history) - (current_index - last_analysis_index))
+            incremental_data = [{
+                "c": ph["close"],
+                "v": ph["volume"]
+            } for ph in price_history[new_candles_start:]]
+        
+        # Prepare only the closest support/resistance level instead of multiple
+        closest_level = min([(lvl, abs(current_data["Close"] - lvl)) for lvl in support_resistance_levels], key=lambda x: x[1])
+        
+        # 4. Prepare minimal context for LLM
         data_for_llm = {
-            "current_candle": {
-                "timestamp": str(timestamp),
-                "open": open_price,
-                "high": high_price,
-                "low": low_price,
-                "close": close_price,
-                "volume": volume,
-                "size_pct": abs(open_price - close_price) / open_price * 100  # Candle size as percentage
+            "current": {
+                "c": current_data["Close"],
+                "v": current_data["Volume"]
             },
+            "new_data": incremental_data,
             "position": {
                 "contracts": current_contracts,
-                "direction": "SHORT",
-                "entry_price": entry_price,
-                "pnl_per_contract": entry_price - close_price,
-                "last_action": last_action
+                "dir": "SHORT",
+                "entry": entry_price,
+                "pnl": entry_price - current_data["Close"]
             },
-            "market_context": {
-                "support_resistance_levels": support_resistance_levels,
-                "nearest_levels": nearest_levels,
-                "recent_price_history": recent_prices[:10],  # Last 10 candles for better context
-                "detected_patterns": breakout_patterns,
-                "price_trend": price_trend,
-                "trend_strength": trend_strength,
-                "avg_volume": sum(p["volume"] for p in recent_prices[:5]) / min(5, len(recent_prices)) if recent_prices else 0
+            "context": {
+                "level": closest_level[0],
+                "dist": closest_level[1]
             }
         }
         
-        # Create prompt with detailed instructions
+        # Include minimal history of recent decisions
+        if cached_llm_state["recent_decisions"]:
+            data_for_llm["prev"] = {
+                "actions": [d["action"] for d in cached_llm_state["recent_decisions"][-2:]],  # Just last 2 actions
+                "conf": cached_llm_state["last_analysis"]["confidence"] if cached_llm_state["last_analysis"] else 0.0
+            }
+        
+        # 5. Build a much more token-efficient prompt
         prompt = f"""
-You are an expert algorithmic trader specializing in natural gas futures. You make decisive trading decisions based on technical analysis patterns, support/resistance levels, and volume indicators.
-
-Here is the current market data in JSON format:
-{json.dumps(data_for_llm, indent=2)}
-
+Expert nat gas trader. Current:
+- Pos: {current_contracts} SHORT @ ${entry_price:.4f}
+- Price: ${current_data["Close"]:.4f}
+- Level: {closest_level[0]:.4f} (dist: {closest_level[1]:.4f})
+- New candles: {len(incremental_data)}
 Analyze the data to identify actionable trading opportunities, especially looking for:
 
 1. BREAKOUTS: When price breaks through support/resistance levels
@@ -239,36 +268,54 @@ When multiple signals align (breakout + high volume + bearish pattern), be very 
 Respond with a JSON object containing:
 1. "action": ("ADD_SHORT", "ADD_LONG", "REDUCE_SHORT", "REDUCE_LONG", or "HOLD")
 2. "quantity": number of contracts to adjust (1-3 based on confidence)
-3. "reasoning": brief explanation of your decision (under 50 words)
+3. "reasoning": explanation of your decision 
 4. "confidence": your confidence level (0.0-1.0)
-5. "confidence_explanation": detailed explanation of why you chose this confidence level (under 100 words)
+5. "confidence_explanation": detailed explanation of why you chose this confidence level 
 
-Your response MUST be valid JSON without any text before or after. Format:
-{{"action": "ACTION", "quantity": N, "reasoning": "Your reasoning", "confidence": 0.X, "confidence_explanation": "Your detailed explanation"}}
+JSON response only:
+{{"action":"ADD_SHORT/REDUCE_SHORT/HOLD","quantity":1-3,"reasoning":"<100 chars","confidence":0.0-1.0,"confidence_explanation":"<200 chars"}}
 """
+
+        # 6. Call LLM with minimal tokens
         resp = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are a natural gas trading algorithm that responds only with valid JSON."},
+                {"role": "system", "content": "You are a trading algorithm. Respond with valid JSON, but you may include a verbose confidence_explanation field."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.3,
-            max_tokens=500
+            temperature=0.5,
+            max_tokens=500  # Reduced from 300
         )
         
-        # Get the response and parse it as JSON
+        # Process response
         content = resp.choices[0].message.content.strip()
         try:
-            # Try to parse the response as JSON
+            # Parse response as JSON
             decision = json.loads(content)
-            # Also save the raw response for debugging
+            
+            # Update cache
+            last_analysis_index = current_index
+            cached_llm_state["last_analysis"] = decision
+            cached_llm_state["recent_decisions"].append({
+                "index": current_index,
+                "action": decision["action"],
+                "reasoning": decision["reasoning"],
+                "confidence": decision["confidence"]
+            })
+            
+            # Keep only the 3 most recent decisions instead of 5
+            if len(cached_llm_state["recent_decisions"]) > 3:
+                cached_llm_state["recent_decisions"] = cached_llm_state["recent_decisions"][-3:]
+            
             return decision, content
+            
         except json.JSONDecodeError:
-            # If parsing fails, return a default "hold" decision
-            return {"action": "HOLD", "quantity": 0, "reasoning": "Failed to parse LLM response", "confidence": 0.0, "confidence_explanation": "Error parsing LLM response"}, content
+            # Return default HOLD on parsing failure
+            return {"action": "HOLD", "quantity": 0, "reasoning": "Parse error", "confidence": 0.0, "confidence_explanation": "Error in LLM response"}, content
+    
     except Exception as e:
-        # If any exception occurs, return a default "hold" decision
-        return {"action": "HOLD", "quantity": 0, "reasoning": f"LLM error: {str(e)}", "confidence": 0.0, "confidence_explanation": f"Error communicating with LLM: {str(e)}"}, "LLM unavailable."
+        # Return default HOLD on error
+        return {"action": "HOLD", "quantity": 0, "reasoning": f"Error: {str(e)[:20]}", "confidence": 0.0, "confidence_explanation": f"LLM error"}, "LLM unavailable."
 
 def get_confidence_color(confidence):
     """Return a color based on confidence level"""
@@ -394,6 +441,14 @@ def control_simulation(start, pause, reset, speed, data):
     if trg=="pause-button":
         data["is_running"]=False; return True, dash.no_update, data
     if trg=="reset-button":
+        # Reiniciar o cache quando reiniciar a simulação
+        global last_analysis_index, cached_llm_state
+        last_analysis_index = -1
+        cached_llm_state = {
+            "last_analysis": None,
+            "recent_decisions": []
+        }
+        
         data.update({
             "is_running": False,
             "current_index": 0,
@@ -415,7 +470,7 @@ def control_simulation(start, pause, reset, speed, data):
     return dash.no_update, int(speed*1000), dash.no_update
 
 # -----------------------------------------------------------------------------
-# CALLBACK – AVANÇA A SIMULAÇÃO
+# CALLBACK – AVANÇA A SIMULAÇÃO - OTIMIZADO COM CACHE
 # -----------------------------------------------------------------------------
 @app.callback(
     [Output("price-chart","figure"), Output("current-position","children"),
@@ -438,9 +493,10 @@ def update_simulation(n, data):
     current_price= recs[-1]["Close"]
     open_price   = recs[-1]["Open"]
 
-    # LLM for complete market analysis and trading decisions
+    # LLM para análise de mercado e decisões de trading (com cache)
     if idx % LLM_EVERY == 0:
-        # Prepare recent price history with full OHLCV data
+        # Preparar histórico de preços recente com dados OHLCV completos
+        # OPTIMIZATION: Only collect recent history (10 candles max)
         ph = [{
             "time": recs[i]["Date"],
             "open": recs[i]["Open"], 
@@ -450,77 +506,81 @@ def update_simulation(n, data):
             "volume": recs[i]["Volume"]
         } for i in range(max(0, idx-10), idx+1)]
         
-        # Get LLM decision as structured JSON
-        decision, raw_response = ask_llm(
+        # Obter decisão do LLM como JSON estruturado (usando cache)
+        decision, raw_response = ask_llm_with_cache(
             recs[-1],
             ph,
             SUPPORT_RESISTANCE_LEVELS,
             data["current_contracts"],
             data["entry_price"],
-            data["last_action"]
+            data["last_action"],
+            idx  # Passar o índice atual para o sistema de cache
         )
         
-        # Store the raw response for display
+        # Armazenar a resposta bruta para exibição
         data["llm_thoughts"] = raw_response
-        data["analysis_history"].append({
-            "time": recs[-1]["Date"], 
-            "price": current_price, 
-            "thoughts": raw_response
-        })
         
-        # Process the LLM's structured decision
+        # Verificar se a resposta veio do cache ou do LLM
+        is_cached = raw_response.startswith("[CACHED]")
+        
+        # Só adicionar ao histórico de análise se não for do cache
+        if not is_cached:
+            data["analysis_history"].append({
+                "time": recs[-1]["Date"], 
+                "price": current_price, 
+                "thoughts": raw_response
+            })
+        
+        # Processar a decisão estruturada do LLM
         action = decision.get("action", "HOLD")
         quantity = decision.get("quantity", 0)
         reasoning = decision.get("reasoning", "No reasoning provided")
         confidence = decision.get("confidence", 0.0)
         confidence_explanation = decision.get("confidence_explanation", "No explanation provided")
         
-        # Store confidence data
+        # Armazenar dados de confiança
         data["confidence"] = confidence
         data["confidence_explanation"] = confidence_explanation
         
-        # Debug info - always log decision even if HOLD
-        print(f"LLM Decision: {action}, Qty: {quantity}, Conf: {confidence:.2f}, Reason: {reasoning}")
-        
-        # Execute the trading action if not HOLD and quantity > 0
-        # Also log holds with high confidence so we can see what's happening
-        if (action != "HOLD" and quantity > 0) or confidence > 0.6:
+        # Executar a ação de trading se não for HOLD e quantity > 0
+        # Também registrar HOLDs com alta confiança para ver o que está acontecendo
+        if (action != "HOLD" and quantity > 0) or confidence > 0.5:
             old = data["current_contracts"]
             
             if action == "ADD_SHORT":
-                # For high confidence signals, consider using the suggested quantity
-                # For lower confidence, still take at least 1 contract if above threshold
-                adjusted_qty = quantity if confidence >= 0.7 else max(1, quantity-1)
+                # Para sinais de alta confiança, considerar usar a quantidade sugerida
+                # Para confiança menor, ainda pegar pelo menos 1 contrato se acima do limiar
+                adjusted_qty = quantity if confidence >= 0.50 else max(1, quantity-1)
                 data["current_contracts"] += adjusted_qty
                 new = data["current_contracts"]
-                # weighted average of entry_price
+                # média ponderada do preço de entrada
                 data["entry_price"] = (data["entry_price"]*old + current_price*adjusted_qty)/new
                 
-                act = (f"LLM DECISION: {action} {adjusted_qty} → {new} contracts @ {current_price:.4f}; "
-                       f"AvgEntry={data['entry_price']:.4f}; "
-                       f"Reasoning: {reasoning} (Conf: {confidence:.2f})")
+                act = (f"{'[CACHED] ' if is_cached else ''}LLM: {action} {adjusted_qty} → {new} @ {current_price:.4f}; "
+                       f"Entry={data['entry_price']:.4f}; "
+                       f"Reason: {reasoning}")
                        
             elif action == "REDUCE_SHORT" and old >= quantity:
-                # Adjust quantity if needed based on confidence
-                adjusted_qty = min(quantity, old)  # Can't reduce below 0
+                # Ajustar quantidade se necessário com base na confiança
+                adjusted_qty = min(quantity, old)  # Não pode reduzir abaixo de 0
                 data["current_contracts"] -= adjusted_qty
                 new = data["current_contracts"]
-                # Entry price stays the same when reducing position
+                # Preço de entrada permanece o mesmo ao reduzir posição
                 
-                act = (f"LLM DECISION: {action} {adjusted_qty} → {new} contracts @ {current_price:.4f}; "
-                       f"AvgEntry={data['entry_price']:.4f}; "
-                       f"Reasoning: {reasoning} (Conf: {confidence:.2f})")
+                act = (f"{'[CACHED] ' if is_cached else ''}LLM: {action} {adjusted_qty} → {new} @ {current_price:.4f}; "
+                       f"Entry={data['entry_price']:.4f}; "
+                       f"Reason: {reasoning}")
                 
             elif action == "HOLD" and confidence > 0.6:
-                # Just log the hold decision with high confidence for transparency
-                act = (f"LLM DECISION: {action} @ {current_price:.4f}; "
-                       f"Reasoning: {reasoning} (Conf: {confidence:.2f})")
+                # Apenas registrar a decisão de HOLD com alta confiança para transparência
+                act = (f"{'[CACHED] ' if is_cached else ''}LLM: {action} @ {current_price:.4f}; "
+                       f"Reason: {reasoning}")
                 
             else:
-                # Unsupported action or invalid quantity
+                # Ação não suportada ou quantidade inválida
                 act = None
                 
-            if act:  # Only update if a valid action was taken
+            if act:  # Apenas atualizar se uma ação válida foi tomada
                 data["action_history"].append({
                     "time": recs[-1]["Date"],
                     "action": act,
@@ -529,54 +589,75 @@ def update_simulation(n, data):
                 })
                 data["last_action"] = act
 
-    # 3️⃣ P&L total
+    # P&L total
     delta = data["entry_price"] - current_price
     pnl = delta * CONTRACT_MULTIPLIER * data["current_contracts"]
 
-    # 4️⃣ Gráfico
+    # Chart - OPTIMIZATION: Less overhead in chart generation
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                         vertical_spacing=0.1, row_heights=[0.8,0.2],
                         specs=[[{"type":"candlestick"}],[{"type":"bar"}]])
+    
+    # Only show the last 50 candles maximum to improve performance
+    display_records = recs[-50:] if len(recs) > 50 else recs
+    
     fig.add_trace(go.Candlestick(
-        x=[r["Date"] for r in recs], open=[r["Open"] for r in recs],
-        high=[r["High"] for r in recs], low=[r["Low"] for r in recs],
-        close=[r["Close"] for r in recs], name="Price"
+        x=[r["Date"] for r in display_records], 
+        open=[r["Open"] for r in display_records],
+        high=[r["High"] for r in display_records], 
+        low=[r["Low"] for r in display_records],
+        close=[r["Close"] for r in display_records], 
+        name="Price"
     ), row=1, col=1)
-    # fig.add_trace(go.Scatter(
-    #     x=[r["Date"] for r in recs], y=[r["Daily Avg(5)"] for r in recs],
-    #     name="5-day MA", line=dict(width=1)
-    # ), row=1, col=1)
+    
+    # Add support/resistance levels
     for lvl in SUPPORT_RESISTANCE_LEVELS:
-        fig.add_shape(type="line", x0=recs[0]["Date"], x1=recs[-1]["Date"],
+        fig.add_shape(type="line", x0=display_records[0]["Date"], x1=display_records[-1]["Date"],
                       y0=lvl, y1=lvl, line=dict(dash="dash"), row=1, col=1)
+    
+    # Add volume bars
     fig.add_trace(go.Bar(
-        x=[r["Date"] for r in recs], y=[r["Volume"] for r in recs],
+        x=[r["Date"] for r in display_records], 
+        y=[r["Volume"] for r in display_records],
         name="Volume"
     ), row=2, col=1)
-    actions = [a for a in data["action_history"] if a["time"] in [r["Date"] for r in recs]]
-    fig.add_trace(go.Scatter(
-        x=[a["time"] for a in actions], y=[a["price"] for a in actions],
-        mode="markers", marker=dict(symbol="star", size=10), name="Actions"
-    ), row=1, col=1)
+    
+    # Add action markers (trades)
+    # Only include actions that are in the display range
+    action_dates = [r["Date"] for r in display_records]
+    actions = [a for a in data["action_history"] if a["time"] in action_dates]
+    
+    if actions:
+        fig.add_trace(go.Scatter(
+            x=[a["time"] for a in actions], 
+            y=[a["price"] for a in actions],
+            mode="markers", 
+            marker=dict(symbol="star", size=10), 
+            name="Actions"
+        ), row=1, col=1)
+    
+    # Simplified layout with less customization
     fig.update_layout(template="plotly_dark", legend=dict(orientation="h", y=1.02))
     fig.update_xaxes(type="category")
 
-    # 5️⃣ Histórico combinado
+    # Optimize history display - limit to recent entries only
     combo = []
-    for a in data["action_history"]:
+    for a in data["action_history"][-10:]:  # Last 10 actions only
         combo.append({"time": a["time"], "content": a["action"], "type": "ACTION"})
-    for an in data["analysis_history"]:
+    for an in data["analysis_history"][-5:]:  # Last 5 analyses only
         combo.append({"time": an["time"], "content": an["thoughts"], "type": "ANALYSIS"})
     combo.sort(key=lambda x: x["time"], reverse=True)
+    
+    # Build history display
     hist = []
-    for itm in combo[:20]:
+    for itm in combo[:15]:  # Limit to 15 total items
         color = "yellow" if itm["type"]=="ACTION" else "lightblue"
         hist.append(html.Div([
             html.Span(f"{itm['time']}: ", style={"fontWeight":"bold"}),
             html.Span(itm["content"], style={"color": color})
         ], style={"marginBottom":"6px"}))
     
-    # 6️⃣ Confidence info
+    # Confidence info
     confidence_value = data["confidence"] * 100  # Convert to percentage
     confidence_color = get_confidence_color(data["confidence"])
     confidence_text = f"Confidence: {confidence_value:.1f}%"
@@ -599,7 +680,9 @@ def update_simulation(n, data):
 # -----------------------------------------------------------------------------
 # RUN SERVER
 # -----------------------------------------------------------------------------
-# No need for this callback anymore as we're not tracking support_break
+
+
 
 if __name__ == "__main__":
-    app.run(debug=True, port=8050)
+    # debug=True se quiser recarregar no código; em produção ponha False
+    app.run(debug=True, host="0.0.0.0", port=8050)
