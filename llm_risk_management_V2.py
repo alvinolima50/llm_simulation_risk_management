@@ -200,7 +200,7 @@ def ask_llm(current_data, price_history, support_resistance_levels, current_cont
             "market_context": {
                 "support_resistance_levels": support_resistance_levels,
                 "nearest_levels": nearest_levels,
-                "recent_price_history": recent_prices[:10],  # Last 10 candles for better context
+                "recent_price_history": recent_prices[:1],  # Last 10 candles for better context
                 "detected_patterns": breakout_patterns,
                 "price_trend": price_trend,
                 "trend_strength": trend_strength,
@@ -213,7 +213,7 @@ def ask_llm(current_data, price_history, support_resistance_levels, current_cont
 You are an expert algorithmic trader specializing in natural gas futures. You make decisive trading decisions based on technical analysis patterns, support/resistance levels, and volume indicators.
 
 Here is the current market data in JSON format:
-{json.dumps(data_for_llm, indent=2)}
+{json.dumps(data_for_llm, separators=(',', ':'))}
 
 Analyze the data to identify actionable trading opportunities, especially looking for:
 
@@ -247,15 +247,15 @@ Your response MUST be valid JSON without any text before or after. Format:
 {{"action": "ACTION", "quantity": N, "reasoning": "Your reasoning", "confidence": 0.X, "confidence_explanation": "Your detailed explanation"}}
 """
         resp = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-3.5-turbo-0125",
             messages=[
                 {"role": "system", "content": "You are a natural gas trading algorithm that responds only with valid JSON."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.3,
-            max_tokens=500
+            max_tokens=150
         )
-        
+
         # Get the response and parse it as JSON
         content = resp.choices[0].message.content.strip()
         try:
@@ -448,7 +448,7 @@ def update_simulation(n, data):
             "low": recs[i]["Low"],
             "close": recs[i]["Close"],
             "volume": recs[i]["Volume"]
-        } for i in range(max(0, idx-10), idx+1)]
+        } for i in range(max(0, idx-2), idx+1)]
         
         # Get LLM decision as structured JSON
         decision, raw_response = ask_llm(
